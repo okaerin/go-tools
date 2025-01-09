@@ -7,6 +7,7 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
+	"io"
 	"io/fs"
 	"log"
 	"os"
@@ -56,6 +57,9 @@ var (
 		Use:   "reverse_stringer",
 		Short: "a simple reverse mapping generator for stringer",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if silenceFlag {
+				log.SetOutput(io.Discard)
+			}
 			return reverseMap()
 		},
 	}
@@ -63,12 +67,13 @@ var (
 	packageName     string
 	lineCommentFlag bool
 	stdoutFlag      bool
+	silenceFlag     bool
 )
 
 func main() {
 	// Execute the root command
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(err)
+		log.Println(err)
 		os.Exit(1)
 	}
 
@@ -81,6 +86,7 @@ func init() {
 	rootCmd.MarkFlagRequired("package-name")
 	rootCmd.Flags().BoolVar(&lineCommentFlag, "line-comment", true, "use the line comment as name")
 	rootCmd.Flags().BoolVar(&stdoutFlag, "stdout", false, "write to stdout instead to file")
+	rootCmd.Flags().BoolVarP(&silenceFlag, "silent", "s", false, "silent output")
 }
 
 func filterEnumAlias(consts []constant) []constant {
@@ -201,6 +207,9 @@ func extractConstants(path string, targetType string, targetPackage string) []co
 	node, err := parser.ParseFile(fs, path, nil, parser.AllErrors|parser.ParseComments)
 	if err != nil {
 		log.Printf("failed to parse file %s: %v", path, err)
+		return nil
+	}
+	if node.Name.Name != targetPackage {
 		return nil
 	}
 	ast.Inspect(node, func(n ast.Node) bool {
