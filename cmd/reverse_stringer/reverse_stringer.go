@@ -116,7 +116,7 @@ func packageHasEnum(pkg *packages.Package, moduleStr string, pkgStr string, enum
 }
 
 // get the enum within a package if available. if pkgStr contains / it is assumed that the full module path is contained. otherwise just the package name from the go source.
-func getEnumFromPackage(pkg *packages.Package, pkgStr string, enumStr string) map[string]any {
+func getEnumFromPackage(pkg *packages.Package, moduleStr string, pkgStr string, enumStr string) map[string]any {
 	if pkg == nil {
 		panic(`missing package`)
 	}
@@ -124,7 +124,12 @@ func getEnumFromPackage(pkg *packages.Package, pkgStr string, enumStr string) ma
 	for _, obj := range pkg.TypesInfo.Defs {
 		c, ok := obj.(*types.Const)
 		//ensure existence
-		if !ok || !packageHasEnum(pkg, "", pkgStr, enumStr) {
+		if !ok || !packageHasEnum(pkg, moduleStr, pkgStr, enumStr) {
+			continue
+		}
+		if n, ok := obj.Type().(*types.Named); !ok {
+			continue
+		} else if cname := n.Obj().Name(); cname != enumStr {
 			continue
 		}
 		m[c.Name()] = c.Val()
@@ -167,7 +172,7 @@ func getEnum(moduleStr string, pkgStr string, enumStr string) (map[string]any, e
 	}
 	//2. get constant values
 	pkg := pkgCandidates[0]
-	m := getEnumFromPackage(pkg, pkgStr, enumStr)
+	m := getEnumFromPackage(pkg, moduleStr, pkgStr, enumStr)
 	if lineCommentFlag {
 		remap := getCommentMapping(pkg)
 		translatedM := map[string]any{}
