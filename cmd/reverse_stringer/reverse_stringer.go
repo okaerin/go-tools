@@ -2,21 +2,21 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/format"
-	"go/parser"
 	"go/token"
+	"go/types"
 	"io"
-	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"text/template"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/tools/go/packages"
 )
 
 const reverseMappingTemplate = `
@@ -43,13 +43,7 @@ func Parse{{.TypeName}}(s string) ({{.TypeName}}, error) {
 type templateObject struct {
 	PackageName string
 	TypeName    string
-	Enums       map[string]string
-}
-
-type constant struct {
-	Name    string
-	Value   string
-	Comment string
+	Enums       map[string]any
 }
 
 var (
@@ -60,11 +54,21 @@ var (
 			if silenceFlag {
 				log.SetOutput(io.Discard)
 			}
+			if cmd.Flags().Changed("working-dir") {
+				if st, err := os.Stat(workingDir); err != nil {
+					return err
+				} else if !st.IsDir() {
+					return fmt.Errorf(`working dir %s is not a directory`, workingDir)
+				}
+				os.Chdir(workingDir)
+			}
 			return reverseMap()
 		},
 	}
 	enumType        string
 	packageName     string
+	moduleString    string
+	workingDir      string
 	lineCommentFlag bool
 	stdoutFlag      bool
 	silenceFlag     bool
@@ -84,54 +88,151 @@ func init() {
 	rootCmd.MarkFlagRequired("enum-type")
 	rootCmd.Flags().StringVarP(&packageName, "package-name", "p", "", "package containing the enum")
 	rootCmd.MarkFlagRequired("package-name")
-	rootCmd.Flags().BoolVar(&lineCommentFlag, "line-comment", true, "use the line comment as name")
+	rootCmd.Flags().StringVarP(&moduleString, "module", "m", "", `module string e.g. "example.com/user/module123"`)
+	rootCmd.Flags().BoolVar(&lineCommentFlag, "line-comment", false, "use the line comment as name")
+	rootCmd.Flags().StringVarP(&workingDir, "working-dir", "w", "", "working dir")
 	rootCmd.Flags().BoolVar(&stdoutFlag, "stdout", false, "write to stdout instead to file")
 	rootCmd.Flags().BoolVarP(&silenceFlag, "silent", "s", false, "silent output")
 }
 
-func filterEnumAlias(consts []constant) []constant {
-	filtered := make([]constant, len(consts))
-	n := 0
-	for _, v := range consts {
-		isAlias := slices.IndexFunc(consts, func(s constant) bool {
-			return s.Name == v.Value
-		}) > -1
-		if !isAlias {
-			filtered[n] = v
-			n++
-		}
+// function used to pre filter for the enum
+func packageHasEnum(pkg *packages.Package, moduleStr string, pkgStr string, enumStr string) bool {
+	if pkg == nil {
+		panic(`missing package`)
 	}
-	return filtered[:n]
+	//pkgpath may contain dashes!
+	if moduleStr != "" && pkg.PkgPath != moduleStr {
+		return false
+	}
+	if !strings.HasSuffix(pkgStr, pkg.Name) {
+		return false
+	}
+	obj := pkg.Types.Scope().Lookup(enumStr)
+	if obj == nil {
+		return false
+	}
+	_, ok := obj.Type().(*types.Named)
+	return ok
 }
 
-func reverseMap() error {
-	//find enum file
-	results, err := findGoFileContainingEnum(".", enumType, packageName)
-	if err != nil {
-		log.Printf("%v\n", err)
-		os.Exit(1)
+// get the enum within a package if available. if pkgStr contains / it is assumed that the full module path is contained. otherwise just the package name from the go source.
+func getEnumFromPackage(pkg *packages.Package, pkgStr string, enumStr string) map[string]any {
+	if pkg == nil {
+		panic(`missing package`)
 	}
-	switch len(results) {
+	var m map[string]any = map[string]any{}
+	for _, obj := range pkg.TypesInfo.Defs {
+		c, ok := obj.(*types.Const)
+		//ensure existence
+		if !ok || !packageHasEnum(pkg, "", pkgStr, enumStr) {
+			continue
+		}
+		m[c.Name()] = c.Val()
+	}
+	return m
+}
+
+func getEnum(moduleStr string, pkgStr string, enumStr string) (map[string]any, error) {
+	cfg := &packages.Config{
+		Mode: packages.NeedName |
+			packages.NeedFiles |
+			packages.NeedCompiledGoFiles |
+			packages.NeedSyntax |
+			packages.NeedTypes |
+			packages.NeedTypesInfo,
+	}
+	pkgs, err := packages.Load(cfg, "./...")
+	if err != nil {
+		return nil, errors.Join(ErrPackageLoad, err)
+	}
+	var pkgCandidates []*packages.Package
+	//1. check for enum existence in pkg
+	for _, pkg := range pkgs {
+		if !packageHasEnum(pkg, moduleStr, pkgStr, enumStr) {
+			continue
+		}
+		pkgCandidates = append(pkgCandidates, pkg)
+	}
+	//3. check if unambiguous or no hits
+	switch len(pkgCandidates) {
 	case 0:
-		log.Printf(`type "%s" not found`+"\n", enumType)
-		os.Exit(1)
+		return nil, errors.Join(ErrNoEnumFound, fmt.Errorf(`no hit for pkg "%s" and enum "%s"`, pkgStr, enumStr))
 	case 1:
 	default:
-		log.Printf(`ambigous type "%s". %d times found`+"\n", enumType, len(results))
-		os.Exit(1)
+		var files []string
+		for _, pkg := range pkgCandidates {
+			files = append(files, strings.Join(pkg.GoFiles, ", "))
+		}
+		return nil, errors.Join(ErrAmbigousEnums, fmt.Errorf(`no unambigous hits for pkg "%s" and enum "%s". see:`+"\n%s", pkgStr, enumStr, strings.Join(files, ", ")))
 	}
-	path := results[0]
-	consts := extractConstants(path, enumType, packageName)
+	//2. get constant values
+	pkg := pkgCandidates[0]
+	m := getEnumFromPackage(pkg, pkgStr, enumStr)
+	if lineCommentFlag {
+		remap := getCommentMapping(pkg)
+		translatedM := map[string]any{}
+		for k := range m {
+			translatedM[remap[k]] = m[k]
+		}
+		return translatedM, nil
+	} else {
+		return m, nil
+	}
+}
+func getCommentMapping(pkg *packages.Package) map[string]string {
+	if pkg == nil {
+		panic(`missing package`)
+	}
+	comments := map[string]string{}
+	for _, file := range pkg.Syntax {
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.CONST {
+				continue
+			}
+
+			for _, spec := range gen.Specs {
+				vs := spec.(*ast.ValueSpec)
+
+				var comment string
+				if vs.Comment != nil {
+					comment = strings.TrimPrefix(vs.Comment.Text(), "//")
+					comment = strings.TrimSpace(comment)
+				}
+
+				for _, name := range vs.Names {
+					//add default mapping if empty
+					if comment == "" {
+						comments[name.Name] = name.Name
+					} else {
+						comments[name.Name], _, _ = strings.Cut(comment, " ")
+					}
+				}
+			}
+		}
+	}
+	return comments
+}
+
+var (
+	ErrNoEnumFound   = errors.New(`no enum found`)
+	ErrAmbigousEnums = errors.New(`ambigous enum. try using the full package module string with the package name appended`)
+	ErrPackageLoad   = errors.New(`Failed to load go packages`)
+)
+
+func reverseMap() error {
+	enum, err := getEnum(moduleString, packageName, enumType)
+	if err != nil {
+		return err
+	}
+
 	//create elements to be templated
 	tObj := &templateObject{
 		PackageName: packageName,
 		TypeName:    enumType,
-		Enums:       make(map[string]string),
+		Enums:       map[bool]map[string]any{true: enum, false: {}}[enum != nil],
 	}
-	for _, c := range filterEnumAlias(consts) {
-		name := map[bool]string{true: strings.TrimSpace(c.Comment), false: c.Name}[lineCommentFlag]
-		tObj.Enums[name] = c.Name
-	}
+
 	//create generated file
 	var buf bytes.Buffer
 	tmpl := template.Must(template.New("reverseMapping").
@@ -148,7 +249,7 @@ func reverseMap() error {
 	// Write result
 	switch stdoutFlag {
 	case false:
-		newFile := filepath.Join(filepath.Dir(path), fmt.Sprintf("%s_reverse_string.go", strings.ToLower(enumType)))
+		newFile := filepath.Join(filepath.Dir(packageName), fmt.Sprintf("%s_reverse_string.go", strings.ToLower(enumType)))
 		if err := os.WriteFile(newFile, formatted, 0644); err != nil {
 			return fmt.Errorf("file write failed: %v", err)
 		}
@@ -158,109 +259,4 @@ func reverseMap() error {
 	}
 
 	return nil
-}
-
-func findGoFileContainingEnum(path string, targetType string, targetPackage string) ([]string, error) {
-	var result []string
-	filepath.Walk(path, func(path string, info fs.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		// Skip non go files
-		if strings.HasSuffix(path, ".go") {
-			if containsEnumType(path, targetType, targetPackage) {
-				result = append(result, path)
-			}
-		}
-		return nil
-	})
-	return result, nil
-}
-
-func containsEnumType(path string, targetType string, targetPackage string) bool {
-	fs := token.NewFileSet()
-	node, err := parser.ParseFile(fs, path, nil, parser.AllErrors)
-	if err != nil {
-		log.Printf("failed to parse file %s: %v", path, err)
-		return false
-	}
-	if node.Name.Name != targetPackage {
-		return false
-	}
-	found := false
-	ast.Inspect(node, func(n ast.Node) bool {
-		typeSpec, ok := n.(*ast.TypeSpec)
-		if ok && typeSpec.Name.Name == targetType {
-			found = true
-			return false //stop inspection
-		}
-		return true
-	})
-
-	return found
-}
-
-func extractConstants(path string, targetType string, targetPackage string) []constant {
-	var consts []constant
-
-	fs := token.NewFileSet()
-	node, err := parser.ParseFile(fs, path, nil, parser.AllErrors|parser.ParseComments)
-	if err != nil {
-		log.Printf("failed to parse file %s: %v", path, err)
-		return nil
-	}
-	if node.Name.Name != targetPackage {
-		return nil
-	}
-	ast.Inspect(node, func(n ast.Node) bool {
-		// Look for a "GenDecl" node (general declarations like const, var)
-		genDecl, ok := n.(*ast.GenDecl)
-		if !ok || genDecl.Tok != token.CONST {
-			return true
-		}
-
-		// Iterate over the specs in the const block
-		for _, spec := range genDecl.Specs {
-			valueSpec, ok := spec.(*ast.ValueSpec)
-			if !ok {
-				continue
-			}
-
-			// Check if the type matches the target type
-			if valueSpec.Type != nil {
-				ident, ok := valueSpec.Type.(*ast.Ident)
-
-				if ok && ident.Name == targetType {
-					// Collect the constants
-					for i, name := range valueSpec.Names {
-						value := ""
-						if i < len(valueSpec.Values) {
-							value = exprToString(valueSpec.Values[i])
-						}
-						consts = append(consts, constant{
-							Name:    name.Name,
-							Value:   value,
-							Comment: valueSpec.Comment.Text(),
-						})
-					}
-				}
-			}
-		}
-		return true
-	})
-	return consts
-}
-
-// exprToString converts an expression to its string representation
-func exprToString(expr ast.Expr) string {
-	switch v := expr.(type) {
-	case *ast.BasicLit:
-		return v.Value
-	case *ast.Ident:
-		return v.Name
-	case *ast.BinaryExpr:
-		return fmt.Sprintf("%s %s %s", exprToString(v.X), v.Op, exprToString(v.Y))
-	default:
-		return ""
-	}
 }
